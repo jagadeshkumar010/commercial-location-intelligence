@@ -12,17 +12,12 @@ import string
 import requests
 from datetime import datetime
 
-# Page Configuration
 st.set_page_config(
     page_title="Commercial Location Intelligence System",
     page_icon="📍",
     layout="wide"
 )
 
-# ---------------------------------------------------------
-# SECURITY, AUTHENTICATION & LOGGING INFRASTRUCTURE
-# ---------------------------------------------------------
-# Loaded securely from Streamlit Secrets or defaults for local dev
 SMTP_SENDER_EMAIL = st.secrets.get("SMTP_EMAIL", "your_email@gmail.com")
 SMTP_APP_PASSWORD = st.secrets.get("SMTP_PASSWORD", "your_16_letter_app_password")
 EXPECTED_USERNAME = "UPES Dissertation"
@@ -68,15 +63,12 @@ School of Advanced Engineering / Business Analytics, UPES
         return False, f"Email delivery failed: {str(e)}"
 
 def resolve_evaluator_ip():
-    """Detects client IP using st.context with external API fallback."""
-    # 1. Native Streamlit context (v1.35+)
     try:
         if hasattr(st, "context") and hasattr(st.context, "ip_address") and st.context.ip_address:
             return str(st.context.ip_address)
     except Exception:
         pass
     
-    # 2. Public IP resolution fallback
     try:
         res = requests.get('https://api.ipify.org?format=json', timeout=4)
         if res.status_code == 200:
@@ -86,7 +78,6 @@ def resolve_evaluator_ip():
     return "127.0.0.1 (Local / Cloud NAT)"
 
 def record_evaluator_audit(email, ip_address):
-    """Logs timestamp, email, IP, and location for digital analytics."""
     log_entry = {
         "timestamp_utc": [datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")],
         "evaluator_email": [email],
@@ -97,9 +88,6 @@ def record_evaluator_audit(email, ip_address):
     file_exists = pd.io.common.file_exists("evaluator_audit_log.csv")
     df_new.to_csv("evaluator_audit_log.csv", mode='a', header=not file_exists, index=False)
 
-# ---------------------------------------------------------
-# SESSION STATE SHIELD
-# ---------------------------------------------------------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "dynamic_otp" not in st.session_state:
@@ -109,9 +97,6 @@ if "otp_sent" not in st.session_state:
 if "evaluator_email" not in st.session_state:
     st.session_state.evaluator_email = ""
 
-# ---------------------------------------------------------
-# GUEST LOGIN PORTAL
-# ---------------------------------------------------------
 if not st.session_state.authenticated:
     st.title("🔒 UPES Dissertation Evaluation Portal")
     st.caption("Commercial Location Intelligence Framework (CLIF) — Secured Evaluator Access")
@@ -161,11 +146,8 @@ if not st.session_state.authenticated:
                     st.session_state.otp_sent = False
                     st.rerun()
 
-    st.stop()  # Halt execution until authenticated
+    st.stop()
 
-# ==============================================================================
-# MAIN COMMERCIAL SITE INTELLIGENCE SYSTEM
-# ==============================================================================
 st.sidebar.markdown(f"**Authenticated:** `{EXPECTED_USERNAME}`")
 st.sidebar.caption(f"Session: `{st.session_state.evaluator_email}`")
 if st.sidebar.button("Logout"):
@@ -177,9 +159,6 @@ st.title("📍 Commercial Site Viability & Location Intelligence System")
 st.caption("Spatial Decision-Support Pipeline for SME Feasibility & Retail White-Space Discovery")
 st.markdown("---")
 
-# ---------------------------------------------------------
-# SIDEBAR CONTROLS
-# ---------------------------------------------------------
 st.sidebar.header("🔍 Input Parameters")
 
 SPECIFIC_CATEGORIES = [
@@ -232,9 +211,6 @@ with st.sidebar.expander("⚙️ Manual Coordinate Override"):
         st.session_state.current_lon = lon_in
         st.session_state.current_address = f"Manual Pin: ({lat_in:.4f}, {lon_in:.4f})"
 
-# ---------------------------------------------------------
-# COMPUTATION HELPER
-# ---------------------------------------------------------
 def evaluate_category(cat_name, lat, lon):
     seed_val = int((abs(lat) + abs(lon)) * 10000 + len(cat_name) * 19) % 100
     rng = np.random.default_rng(seed_val)
@@ -278,21 +254,17 @@ def evaluate_category(cat_name, lat, lon):
         "Comp. Friction": round(float(comp_severity), 2)
     }
 
-# ---------------------------------------------------------
-# MAIN INTERFACE: MAP & ANALYTICS
-# ---------------------------------------------------------
 col_map, col_report = st.columns([1.05, 0.95])
 
 with col_map:
     st.subheader("🗺️ Micro-Catchment Spatial Map")
     st.write(f"**Target Location:** `{st.session_state.current_address}`")
 
-# ✅ NEW LINE (Clean, full-color OpenStreetMap with zero watermarks):
-m = folium.Map(
-    location=[st.session_state.current_lat, st.session_state.current_lon],
-    zoom_start=15,
-    tiles="OpenStreetMap"
-)
+    m = folium.Map(
+        location=[st.session_state.current_lat, st.session_state.current_lon],
+        zoom_start=15,
+        tiles="OpenStreetMap"
+    )
 
     folium.Circle(
         radius=500,
@@ -382,9 +354,6 @@ with col_report:
             else:
                 st.error(f"**Site Rejected**: High spatial saturation and low transit permeability. Severe probability of operational deficit.")
 
-# ---------------------------------------------------------
-# ADMIN DIGITAL AUDIT LOG VIEWER (FOR COMMERCIALIZATION)
-# ---------------------------------------------------------
 st.markdown("---")
 with st.expander("🔐 Admin Console: Digital Footprint & Audit Log"):
     admin_pass = st.text_input("Enter Admin Access Password", type="password", key="admin_pwd_field")
