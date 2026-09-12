@@ -287,11 +287,12 @@ with col_map:
     st.subheader("🗺️ Micro-Catchment Spatial Map")
     st.write(f"**Target Location:** `{st.session_state.current_address}`")
 
-    m = folium.Map(
-        location=[st.session_state.current_lat, st.session_state.current_lon],
-        zoom_start=15,
-        tiles="CartoDB positron"
-    )
+# ✅ NEW LINE (Clean, full-color OpenStreetMap with zero watermarks):
+m = folium.Map(
+    location=[st.session_state.current_lat, st.session_state.current_lon],
+    zoom_start=15,
+    tiles="OpenStreetMap"
+)
 
     folium.Circle(
         radius=500,
