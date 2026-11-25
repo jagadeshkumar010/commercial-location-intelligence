@@ -5,12 +5,9 @@ import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-import smtplib
-from email.mime.text import MIMEText
-import random
-import string
 import requests
 from datetime import datetime
+import os
 
 st.set_page_config(
     page_title="Commercial Location Intelligence System",
@@ -18,9 +15,9 @@ st.set_page_config(
     layout="wide"
 )
 
-SMTP_SENDER_EMAIL = st.secrets.get("SMTP_EMAIL", "your_email@gmail.com")
-SMTP_APP_PASSWORD = st.secrets.get("SMTP_PASSWORD", "your_16_letter_app_password")
-EXPECTED_USERNAME = "UPES Dissertation"
+EXPECTED_USER = "UPES Evaluator"
+AUDIT_LOG_FILE = "evaluator_audit_log.csv"
+METRICS_FILE = "clif_telemetry_metrics.csv"
 
 @st.cache_resource
 def get_geolocator():
@@ -28,143 +25,91 @@ def get_geolocator():
 
 geolocator = get_geolocator()
 
-def generate_dynamic_token(length=6):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-def send_dynamic_password_email(recipient_email, dynamic_pass):
-    subject = "Access Key: UPES Dissertation Location Intelligence System"
-    body = f"""Dear Evaluator,
-
-Thank you for reviewing the Commercial Location Intelligence Framework (CLIF) dissertation project.
-
-Here are your single-session evaluation credentials:
---------------------------------------------------
-Username:           {EXPECTED_USERNAME}
-Dynamic Access Key: {dynamic_pass}
---------------------------------------------------
-
-This one-time key is active for your current browser session.
-
-Sincerely,
-Commercial Location Intelligence Research Team
-School of Advanced Engineering / Business Analytics, UPES
-"""
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = SMTP_SENDER_EMAIL
-    msg['To'] = recipient_email
-
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(SMTP_SENDER_EMAIL, SMTP_APP_PASSWORD)
-            server.sendmail(SMTP_SENDER_EMAIL, recipient_email, msg.as_string())
-        return True, "Dynamic Access Key sent to your email successfully."
-    except Exception as e:
-        return False, f"Email delivery failed: {str(e)}"
-
 def resolve_evaluator_ip():
     try:
         if hasattr(st, "context") and hasattr(st.context, "ip_address") and st.context.ip_address:
             return str(st.context.ip_address)
     except Exception:
         pass
-    
     try:
-        res = requests.get('https://api.ipify.org?format=json', timeout=4)
+        res = requests.get("https://api.ipify.org?format=json", timeout=3)
         if res.status_code == 200:
-            return res.json().get('ip')
+            return res.json().get("ip", "Unknown")
     except Exception:
         pass
     return "127.0.0.1 (Local / Cloud NAT)"
 
-def record_evaluator_audit(email, ip_address):
-    log_entry = {
-        "timestamp_utc": [datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")],
-        "evaluator_email": [email],
-        "ip_address": [ip_address],
-        "authorized_user": [EXPECTED_USERNAME]
-    }
-    df_new = pd.DataFrame(log_entry)
-    file_exists = pd.io.common.file_exists("evaluator_audit_log.csv")
-    df_new.to_csv("evaluator_audit_log.csv", mode='a', header=not file_exists, index=False)
+def load_metrics():
+    if os.path.exists(METRICS_FILE):
+        try:
+            df = pd.read_csv(METRICS_FILE)
+            if not df.empty:
+                return int(df.loc[0, "total_accesses"]), int(df.loc[0, "reports_downloaded"])
+        except Exception:
+            pass
+    return 0, 0
 
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "dynamic_otp" not in st.session_state:
-    st.session_state.dynamic_otp = None
-if "otp_sent" not in st.session_state:
-    st.session_state.otp_sent = False
-if "evaluator_email" not in st.session_state:
-    st.session_state.evaluator_email = ""
+def save_metrics(access_count, report_count):
+    df = pd.DataFrame([{
+        "total_accesses": int(access_count),
+        "reports_downloaded": int(report_count),
+        "last_updated_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    }])
+    df.to_csv(METRICS_FILE, index=False)
 
-# ---------------------------------------------------------
-# GUEST LOGIN SHIELD
-# ---------------------------------------------------------
-if not st.session_state.authenticated:
-    st.title("🔒 UPES Dissertation Evaluation Portal")
-    st.caption("Commercial Location Intelligence Framework (CLIF) — Secured Evaluator Access")
-    st.markdown("---")
+def record_access_event(ip_address):
+    log_entry = pd.DataFrame([{
+        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": "APP_ACCESS",
+        "ip_address": ip_address,
+        "detail": "Evaluator opened workspace"
+    }])
+    file_exists = os.path.exists(AUDIT_LOG_FILE)
+    log_entry.to_csv(AUDIT_LOG_FILE, mode="a", header=not file_exists, index=False)
 
-    col_login, _ = st.columns([1.1, 0.9])
-    with col_login:
-        st.subheader("Evaluator Access Verification")
-        st.text_input("Username", value=EXPECTED_USERNAME, disabled=True)
-        eval_email = st.text_input("Evaluator Email Address", placeholder="e.g., evaluator@upes.ac.in or personal email")
+def record_report_download(report_type, ip_address):
+    _, current_reports = load_metrics()
+    current_accesses, _ = load_metrics()
+    new_report_count = current_reports + 1
+    st.session_state.reports_downloaded = new_report_count
+    save_metrics(current_accesses, new_report_count)
 
-        if not st.session_state.otp_sent:
-            if st.button("Generate & Send Dynamic Access Key", use_container_width=True, type="primary"):
-                if eval_email and "@" in eval_email:
-                    new_token = generate_dynamic_token()
-                    st.session_state.dynamic_otp = new_token
-                    st.session_state.evaluator_email = eval_email.strip()
-                    
-                    with st.spinner("Dispatching one-time key to your inbox..."):
-                        success, status_msg = send_dynamic_password_email(eval_email.strip(), new_token)
-                    
-                    if success:
-                        st.session_state.otp_sent = True
-                        st.success(status_msg)
-                        st.rerun()
-                    else:
-                        st.error(status_msg)
-                else:
-                    st.warning("Please enter a valid email address.")
-        else:
-            st.info(f"Key dispatched to: **{st.session_state.evaluator_email}** (Check inbox or spam folder)")
-            entered_key = st.text_input("Enter 6-Character Access Key:", type="password")
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Authenticate & Launch", use_container_width=True, type="primary"):
-                    if entered_key.strip().upper() == st.session_state.dynamic_otp:
-                        st.session_state.authenticated = True
-                        client_ip = resolve_evaluator_ip()
-                        record_evaluator_audit(st.session_state.evaluator_email, client_ip)
-                        st.success("Credentials authenticated. Initializing spatial layers...")
-                        st.rerun()
-                    else:
-                        st.error("Invalid dynamic key. Please check your email and retry.")
-            with c2:
-                if st.button("Resend Key", use_container_width=True):
-                    st.session_state.otp_sent = False
-                    st.rerun()
+    log_entry = pd.DataFrame([{
+        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": "REPORT_DOWNLOAD",
+        "ip_address": ip_address,
+        "detail": report_type
+    }])
+    file_exists = os.path.exists(AUDIT_LOG_FILE)
+    log_entry.to_csv(AUDIT_LOG_FILE, mode="a", header=not file_exists, index=False)
 
-    st.stop()
+# Initialize persistent metrics + single-session tracking
+disk_accesses, disk_reports = load_metrics()
+if "reports_downloaded" not in st.session_state:
+    st.session_state.reports_downloaded = disk_reports
+
+if "session_logged" not in st.session_state:
+    client_ip = resolve_evaluator_ip()
+    st.session_state.client_ip = client_ip
+    new_access_count = disk_accesses + 1
+    st.session_state.total_accesses = new_access_count
+    save_metrics(new_access_count, st.session_state.reports_downloaded)
+    record_access_event(client_ip)
+    st.session_state.session_logged = True
+else:
+    st.session_state.total_accesses = max(disk_accesses, st.session_state.get("total_accesses", disk_accesses))
 
 # ---------------------------------------------------------
-# AUTHENTICATED WORKSPACE
+# SIDEBAR & TELEMETRY SUMMARY
 # ---------------------------------------------------------
-st.sidebar.markdown(f"**Authenticated:** `{EXPECTED_USERNAME}`")
-st.sidebar.caption(f"Session: `{st.session_state.evaluator_email}`")
-if st.sidebar.button("Logout"):
-    st.session_state.authenticated = False
-    st.session_state.otp_sent = False
-    st.rerun()
+st.sidebar.markdown(f"**Workspace:** `{EXPECTED_USER}`")
+st.sidebar.caption("Direct access enabled (no login required)")
 
-st.title("📍 Commercial Site Viability & Location Intelligence System")
-st.caption("Spatial Decision-Support Pipeline for SME Feasibility & Retail White-Space Discovery")
-st.markdown("---")
+m_col1, m_col2 = st.sidebar.columns(2)
+m_col1.metric("Total Accesses", st.session_state.total_accesses)
+m_col2.metric("Reports Downloaded", st.session_state.reports_downloaded)
 
+st.sidebar.markdown("---")
 st.sidebar.header("🔍 Input Parameters")
 
 SPECIFIC_CATEGORIES = [
@@ -218,7 +163,20 @@ with st.sidebar.expander("⚙️ Manual Coordinate Override"):
         st.session_state.current_address = f"Manual Pin: ({lat_in:.4f}, {lon_in:.4f})"
 
 # ---------------------------------------------------------
-# COMPUTATION HELPER WITH BACKUP EXPLANATION VECTORS
+# HEADER & LIVE COUNTERS
+# ---------------------------------------------------------
+st.title("📍 Commercial Site Viability & Location Intelligence System")
+st.caption("CLIF — Spatial Decision-Support Pipeline for SME Feasibility & Retail White-Space Discovery")
+
+top_k1, top_k2, top_k3 = st.columns(3)
+top_k1.metric("App Access Count", st.session_state.total_accesses)
+top_k2.metric("Reports Downloaded", st.session_state.reports_downloaded)
+top_k3.metric("Active Catchment Radius", "500 m")
+
+st.markdown("---")
+
+# ---------------------------------------------------------
+# COMPUTATION HELPER
 # ---------------------------------------------------------
 def evaluate_category(cat_name, lat, lon):
     seed_val = int((abs(lat) + abs(lon)) * 10000 + len(cat_name) * 19) % 100
@@ -254,7 +212,6 @@ def evaluate_category(cat_name, lat, lon):
         tier = "Tier 4: Saturated"
         risk = "Critical Risk"
 
-    # Normalized component values for SVI reconstitution
     norm_demand = float(daily_demand / 550.0)
     norm_access = float(access_score / 6.0)
     norm_top = float(node_centrality / 0.10)
@@ -338,7 +295,7 @@ with col_report:
             ]
             df_results = pd.DataFrame(results_list).sort_values(by="SVI Score", ascending=False).reset_index(drop=True)
             st.session_state.current_eval_data = df_results
-            
+
             top_rec = df_results.iloc[0]
             worst_rec = df_results.iloc[-1]
 
@@ -360,7 +317,7 @@ with col_report:
         else:
             res = evaluate_category(business_type, st.session_state.current_lat, st.session_state.current_lon)
             st.session_state.current_eval_data = pd.DataFrame([res])
-            
+
             m1, m2 = st.columns(2)
             m1.metric("Site Viability Index (SVI)", f"{res['SVI Score']} / 100")
             m2.metric("Investment Tier", res["Tier"], delta=res["Risk Level"])
@@ -381,91 +338,90 @@ with col_report:
                 st.error(f"**Site Rejected**: High spatial saturation and low transit permeability. Severe probability of operational deficit.")
 
 # ---------------------------------------------------------
-# EVALUATOR PARAMETER FORMULATION & BACKUP DATA AUDIT
+# EVALUATOR PARAMETER FORMULATION & REPORT DOWNLOADS
 # ---------------------------------------------------------
 st.markdown("---")
-st.subheader("📐 Evaluator Review: Mathematical Formulations & Parameter Basis")
+st.subheader("📐 Evaluator Review: Mathematical Formulations & Report Export")
 
-tab1, tab2 = st.tabs(["Mathematical Derivations & Formulas", "Active Backup Data & Raw Matrix Inspector"])
+tab1, tab2 = st.tabs(["Mathematical Derivations & Formulas", "Site Evaluation Report & Data Export"])
 
 with tab1:
     st.markdown("""
     #### 1. Site Viability Index (SVI)
     Synthesized using an **Analytic Hierarchy Process (AHP)** multi-criteria matrix ($CR = 0.038 < 0.10$):
     $$\\text{SVI} = 100 \\times \\Big( 0.442 \\cdot D_{\\text{norm}} + 0.228 \\cdot A_{\\text{norm}} + 0.098 \\cdot T_{\\text{norm}} - 0.232 \\cdot C_{\\text{norm}} \\Big)$$
-    * **$D_{\\text{norm}}$ (Demand Weight: 44.2%):** Normalized micro-catchment categorical sales volume.
-    * **$A_{\\text{norm}}$ (Anchor Access Weight: 22.8%):** Distance-decayed proximity to public transit and pedestrian generators.
-    * **$T_{\\text{norm}}$ (Road Topology Weight: 9.8%):** Graph betweenness centrality ($C_B$) and intersection density via `OSMnx`.
-    * **$C_{\\text{norm}}$ (Competitor Penalty: -23.2%):** Spatial cannibalization deduction from direct substitutes.
 
-    ---
+    #### 2. Anchor Access Score ($A_S$) & Competitor Friction Penalty ($C_P$)
+    $$A_S = \\sum_{j=1}^{M} \\alpha_j \\cdot \\exp\\left(-\\frac{d_j^2}{2\\sigma_{\\text{anchor}}^2}\\right), \\quad
+      C_P = \\sum_{c=1}^{N} \\delta_c \\cdot \\exp\\left(-\\frac{d_c^2}{2\\sigma_{\\text{comp}}^2}\\right)$$
 
-    #### 2. Anchor Access Score ($A_S$)
-    Calculated via continuous **Gaussian Kernel Distance-Decay** to prevent arbitrary edge boundary cutoffs:
-    $$A_S = \\sum_{j=1}^{M} \\alpha_j \\cdot \\exp\\left(-\\frac{d_j^2}{2\\sigma_{\\text{anchor}}^2}\\right)$$
-    * Bandwidth: $\\sigma_{\\text{anchor}} = 500\\text{ meters}$.
-    * Weights ($\\alpha_j$): Metro Entrance = $1.0$, Bus Terminal = $0.6$, Bank/ATM = $0.4$, Anchor Retailer = $0.5$.
-
-    ---
-
-    #### 3. Competitor Friction Penalty ($C_P$)
-    Measures spatial cannibalization and direct rivalry using a constrained distance decay:
-    $$C_P = \\sum_{c=1}^{N} \\delta_c \\cdot \\exp\\left(-\\frac{d_c^2}{2\\sigma_{\\text{comp}}^2}\\right)$$
-    * Bandwidth: $\\sigma_{\\text{comp}} = 250\\text{ meters}$ (reflects acute localized competition).
-    * Severity factor ($\\delta_c$): Direct identical substitute = $1.0$, Partial substitute = $0.5$.
-
-    ---
-
-    #### 4. Estimated Daily Demand
-    Forecasted via an **XGBoost Regressor** ($R^2 = 0.891, \\text{RMSE} = 8.42$) utilizing:
-    $$\\hat{Y}_{t} = f\\Big(\\text{DayOfWeek}, \\text{Month}, \\sin(t), \\cos(t), \\text{Lag}_{1\\text{d}}, \\text{Lag}_{7\\text{d}}, \\text{PPI}_{\\text{ward}}, d_{\\text{transit}}\\Big)$$
-    Where $\\text{PPI}$ (Purchasing Power Index) maps census pucca housing ratios and local ATM density.
-
-    ---
-
-    #### 5. Investment Feasibility Tiers
-    * **Tier 1 (Prime):** $\\text{SVI} \\ge 80.0$ $\\rightarrow$ High demand, minimal competitor friction. Break-even: 6–8 months.
-    * **Tier 2 (Viable):** $65.0 \\le \\text{SVI} < 80.0$ $\\rightarrow$ Sustainable customer volume. 3-month liquidity reserve recommended.
-    * **Tier 3 (Marginal):** $50.0 \\le \\text{SVI} < 65.0$ $\\rightarrow$ Dense competitor presence. Requires aggressive price or service differentiation.
-    * **Tier 4 (Saturated):** $\\text{SVI} < 50.0$ $\\rightarrow$ Severe spatial cannibalization and weak anchor exposure. Capital loss risk.
+    #### 3. Demand Forecast & Feasibility Tiers
+    Forecasted via **XGBoost Regressor** ($R^2 = 0.891, \\text{RMSE} = 8.42$) with tiers: **Tier 1 (Prime $\\ge 80$)**, **Tier 2 (Viable $65\\text{–}79.9$)**, **Tier 3 (Marginal $50\\text{–}64.9$)**, and **Tier 4 (Saturated $< 50$)**.
     """)
 
 with tab2:
-    st.markdown("#### Real-Time Parameter Backup Inspector")
-    st.write("Current evaluated coordinate features and intermediate normalized parameters:")
-    
+    st.markdown("#### Downloadable Evaluation Report")
     if "current_eval_data" in st.session_state and not st.session_state.current_eval_data.empty:
         st.dataframe(st.session_state.current_eval_data, use_container_width=True)
-        
-        csv_download = st.session_state.current_eval_data.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Parameter Backup Dataset (CSV)",
-            data=csv_download,
-            file_name=f"site_evaluation_parameters_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
+
+        # 1. Text/Markdown Feasibility Report Download
+        report_lines = [
+            "CLIF SITE VIABILITY EVALUATION REPORT",
+            f"Generated (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Location: {st.session_state.current_address} ({st.session_state.current_lat:.5f}, {st.session_state.current_lon:.5f})",
+            f"Selection Mode: {business_type}",
+            "-" * 60,
+            st.session_state.current_eval_data.to_string(index=False)
+        ]
+        report_txt = "\n".join(report_lines).encode("utf-8")
+
+        c_dl1, c_dl2 = st.columns(2)
+        with c_dl1:
+            st.download_button(
+                label="📄 Download Feasibility Report (.TXT)",
+                data=report_txt,
+                file_name=f"clif_feasibility_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                on_click=record_report_download,
+                args=("Feasibility Report (.TXT)", st.session_state.client_ip)
+            )
+
+        with c_dl2:
+            csv_download = st.session_state.current_eval_data.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download Parameter Data (.CSV)",
+                data=csv_download,
+                file_name=f"site_evaluation_parameters_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                on_click=record_report_download,
+                args=("Parameter Dataset (.CSV)", st.session_state.client_ip)
+            )
     else:
-        st.info("Run an evaluation above to generate and inspect the raw parameter backup matrix.")
+        st.info("Run an evaluation above to generate and download a site report.")
 
 # ---------------------------------------------------------
-# ADMIN DIGITAL AUDIT LOG VIEWER
+# ADMIN TELEMETRY & AUDIT LOG VIEWER
 # ---------------------------------------------------------
 st.markdown("---")
-with st.expander("🔐 Admin Console: Digital Footprint & Audit Log"):
+with st.expander("🔐 Admin Console: Access & Report Download Telemetry"):
     admin_pass = st.text_input("Enter Admin Access Password", type="password", key="admin_pwd_field")
     if admin_pass == "UPES_ADMIN_2026":
-        try:
-            audit_df = pd.read_csv("evaluator_audit_log.csv")
-            st.markdown("### Captured Evaluator Footprints")
+        k1, k2 = st.columns(2)
+        k1.metric("Total App Accesses", st.session_state.total_accesses)
+        k2.metric("Total Reports Downloaded", st.session_state.reports_downloaded)
+
+        if os.path.exists(AUDIT_LOG_FILE):
+            audit_df = pd.read_csv(AUDIT_LOG_FILE)
             st.dataframe(audit_df, use_container_width=True)
-            csv_bytes = audit_df.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="📥 Export Audit Log (CSV)",
-                data=csv_bytes,
-                file_name=f"evaluator_audit_log_{datetime.utcnow().strftime('%Y%m%d')}.csv",
-                mime="text/csv"
+                label="📥 Export Telemetry Audit Log (CSV)",
+                data=audit_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"clif_telemetry_log_{datetime.utcnow().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                on_click=record_report_download,
+                args=("Telemetry Audit Log (.CSV)", st.session_state.client_ip)
             )
-        except FileNotFoundError:
-            st.write("No evaluation sessions recorded yet.")
+        else:
+            st.write("No telemetry events recorded yet.")
     elif admin_pass:
         st.error("Unauthorized Admin Key.")
