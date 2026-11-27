@@ -1,723 +1,477 @@
-WATER_KEYWORDS = [
-    "sea", "ocean", "lake", "river", "reservoir", "dam", "backwater",
-    "lagoon", "bay", "gulf", "strait", "canal", "pond", "wetland",
-    "arabian sea", "bay of bengal", "stream", "creek"
-]
-UNINHABITED_KEYWORDS = [
-    "forest", "reserve forest", "reserved forest", "rf", "national park",
-    "wildlife sanctuary", "sanctuary", "tiger reserve", "biosphere",
-    "glacier", "desert", "barren", "uninhabited", "restricted area",
-    "ghat", "hills", "range", "jungle", "woodland"
-]
-
-def check_osm_site_context(lat, lon, radius=300):
-    """
-    Queries OSM Overpass around (lat, lon) to detect forest/water/protected zones
-    and check whether any buildings, roads, or amenities exist nearby.
-    Returns dict or None if network/Overpass is unreachable.
-    """
-    query = f"""
-    [out:json][timeout:6];
-    (
-      way["landuse"~"forest|reservoir|basin"](around:{radius},{lat},{lon});
-      relation["landuse"~"forest|reservoir|basin"](around:{radius},{lat},{lon});
-      way["natural"~"wood|water|wetland|scrub|bare_rock"](around:{radius},{lat},{lon});
-      way["boundary"~"national_park|protected_area"](around:{radius},{lat},{lon});
-      relation["boundary"~"national_park|protected_area"](around:{radius},{lat},{lon});
-      node["place"~"isolated_dwelling|hamlet|village|town|city|suburb"](around:{radius},{lat},{lon});
-      way["building"](around:{radius},{lat},{lon});
-      way["highway"~"residential|tertiary|secondary|primary|trunk|living_street|unclassified|service"](around:{radius},{lat},{lon});
-    );
-    out tags center;
-    """
-    try:
-        resp = requests.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=7)
-        if resp.status_code != 200:
-            return None
-        elements = resp.json().get("elements", [])
-
-        has_forest_or_protected = False
-        has_water = False
-        has_settlement_or_structure = False
-
-        for el in elements:
-            tags = el.get("tags", {})
-            landuse = str(tags.get("landuse", "")).lower()
-            natural = str(tags.get("natural", "")).lower()
-            boundary = str(tags.get("boundary", "")).lower()
-
-            if "forest" in landuse or natural in {"wood", "scrub", "bare_rock"} or boundary in {"national_park", "protected_area"}:
-                has_forest_or_protected = True
-            if landuse in {"reservoir", "basin"} or natural in {"water", "wetland"}:
-                has_water = True
-            if "building" in tags or "highway" in tags or "place" in tags:
-                has_settlement_or_structure = True
-
-        return {
-            "has_forest_or_protected": has_forest_or_protected,
-            "has_water": has_water,
-            "has_settlement_or_structure": has_settlement_or_structure,
-        }
-    except Exception:
-        return None
-
-def check_site_habitability(lat, lon, address_text, force_mode="Auto-Detect"):
-    """
-    Checks whether a location is a forest/uninhabited area, water body, or isolated place.
-    Returns (is_possible: bool, status_label: str, reason_detail: str)
-    """
-    if force_mode == "Force: Water Body":
-        return False, "NOT POSSIBLE (Water Body)", "Site falls within or on a water body; establishing a shop is not possible."
-    if force_mode == "Force: Uninhabited Area":
-        return False, "NOT POSSIBLE (Uninhabited / Forest Area)", "Site is in an uninhabited/forest/protected zone; establishing a shop is not possible."
-    if force_mode == "Force: Isolated / No Population":
-        return False, "NOT POSSIBLE (Isolated Place)", "Site is isolated with no viable population catchment; establishing a shop is not possible."
-
-    combined_texts = [(address_text or "").lower()]
-
-    # Always inspect reverse-geocoded address for forest/terrain/water indicators
-    try:
-        rev = geolocator.reverse((lat, lon), timeout=6)
-        if rev and rev.address:
-            combined_texts.append(rev.address.lower())
-    except Exception:
-        pass
-
-    full_text = " | ".join(combined_texts)
-
-    for kw in WATER_KEYWORDS:
-        if kw in full_text:
-            return False, "NOT POSSIBLE (Water Body)", f"Detected water-body feature ('{kw}') near ({lat:.5f}, {lon:.5f}); it is not possible to establish a shop."
-
-    for kw in UNINHABITED_KEYWORDS:
-        if kw in full_text:
-            return False, "NOT POSSIBLE (Uninhabited / Forest Area)", f"Detected forest/uninhabited terrain indicator ('{kw}') near ({lat:.5f}, {lon:.5f}); it is not possible to establish a shop."
-
-    osm_ctx = check_osm_site_context(lat, lon, radius=300)
-    if osm_ctx is not None:
-        if osm_ctx["has_water"] and not osm_ctx["has_settlement_or_structure"]:
-            return False, "NOT POSSIBLE (Water Body)", f"OSM spatial layer shows a water body with no built/inhabited structures within 300m of ({lat:.5f}, {lon:.5f}); shop establishment is not possible."
-        if osm_ctx["has_forest_or_protected"] and not osm_ctx["has_settlement_or_structure"]:
-            return False, "NOT POSSIBLE (Uninhabited / Forest Area)", f"OSM spatial layer identifies forest/protected land with no settlement/built structures within 300m of ({lat:.5f}, {lon:.5f}); it is not possible to establish a shop."
-        if not osm_ctx["has_settlement_or_structure"]:
-            return False, "NOT POSSIBLE (Isolated Place)", f"No inhabited buildings, settlements, or road/amenity structures found within 300m of ({lat:.5f}, {lon:.5f}); location appears isolated and unviable for a shop."
-
-    return True, "FEASIBLE (Populated / Accessible)", "Location shows habitable/accessible context for commercial retail evaluation."
-import streamlit as st
-import pandas as pd
 import numpy as np
-import folium
-from streamlit_folium import st_folium
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-import requests
-from datetime import datetime
-import os
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+import xgboost as xgb
+from sklearn.cluster import DBSCAN, KMeans
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
+
+STREAMLIT_APP_URL = "https://commercial-location-intelligence-khjt7prif574msk2tvddnf.streamlit.app/"
+GITHUB_REPO_URL = "https://github.com/jagadeshkumar010/commercial-location-intelligence"
 
 st.set_page_config(
-    page_title="Commercial Location Intelligence System",
+    page_title="Commercial Location Intelligence & SME Feasibility",
     page_icon="📍",
-    layout="wide"
+    layout="wide",
 )
 
-EXPECTED_USER = "UPES Evaluator"
-AUDIT_LOG_FILE = "evaluator_audit_log.csv"
-METRICS_FILE = "clif_telemetry_metrics.csv"
-
-@st.cache_resource
-def get_geolocator():
-    return Nominatim(user_agent="clif_evaluator_system_2026")
-
-geolocator = get_geolocator()
-
-def resolve_evaluator_ip():
-    try:
-        if hasattr(st, "context") and hasattr(st.context, "ip_address") and st.context.ip_address:
-            return str(st.context.ip_address)
-    except Exception:
-        pass
-    try:
-        res = requests.get("https://api.ipify.org?format=json", timeout=3)
-        if res.status_code == 200:
-            return res.json().get("ip", "Unknown")
-    except Exception:
-        pass
-    return "127.0.0.1 (Local / Cloud NAT)"
-
-def load_metrics():
-    if os.path.exists(METRICS_FILE):
-        try:
-            df = pd.read_csv(METRICS_FILE)
-            if not df.empty:
-                return int(df.loc[0, "total_accesses"]), int(df.loc[0, "reports_downloaded"])
-        except Exception:
-            pass
-    return 0, 0
-
-def save_metrics(access_count, report_count):
-    df = pd.DataFrame([{
-        "total_accesses": int(access_count),
-        "reports_downloaded": int(report_count),
-        "last_updated_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }])
-    df.to_csv(METRICS_FILE, index=False)
-
-def record_access_event(ip_address):
-    log_entry = pd.DataFrame([{
-        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "event_type": "APP_ACCESS",
-        "ip_address": ip_address,
-        "detail": "Evaluator opened workspace"
-    }])
-    file_exists = os.path.exists(AUDIT_LOG_FILE)
-    log_entry.to_csv(AUDIT_LOG_FILE, mode="a", header=not file_exists, index=False)
-
-def record_report_download(report_type, ip_address):
-    current_accesses, current_reports = load_metrics()
-    new_report_count = current_reports + 1
-    st.session_state.reports_downloaded = new_report_count
-    save_metrics(current_accesses, new_report_count)
-
-    log_entry = pd.DataFrame([{
-        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "event_type": "REPORT_DOWNLOAD",
-        "ip_address": ip_address,
-        "detail": report_type
-    }])
-    file_exists = os.path.exists(AUDIT_LOG_FILE)
-    log_entry.to_csv(AUDIT_LOG_FILE, mode="a", header=not file_exists, index=False)
-
-# Initialize persistent metrics + single-session tracking
-disk_accesses, disk_reports = load_metrics()
-if "reports_downloaded" not in st.session_state:
-    st.session_state.reports_downloaded = disk_reports
-
-if "session_logged" not in st.session_state:
-    client_ip = resolve_evaluator_ip()
-    st.session_state.client_ip = client_ip
-    new_access_count = disk_accesses + 1
-    st.session_state.total_accesses = new_access_count
-    save_metrics(new_access_count, st.session_state.reports_downloaded)
-    record_access_event(client_ip)
-    st.session_state.session_logged = True
-else:
-    st.session_state.total_accesses = max(disk_accesses, st.session_state.get("total_accesses", disk_accesses))
-
-# ---------------------------------------------------------
-# CATEGORY & CONTEXT ASSUMPTION PROFILES (REALISTIC SME BASELINE)
-# ---------------------------------------------------------
-CATEGORY_PROFILES = {
-    "Daily Convenience / Kirana Store": {
-        "footfall_range": (85, 155),
-        "conv_range": (0.65, 0.75),
-        "avg_spend": 125,
-        "gross_margin": 0.15,
-        "base_opex": 42000,
-        "comp_range": (0.8, 2.4),
-    },
-    "Pharmacy / Healthcare Retail": {
-        "footfall_range": (65, 125),
-        "conv_range": (0.70, 0.80),
-        "avg_spend": 210,
-        "gross_margin": 0.19,
-        "base_opex": 48000,
-        "comp_range": (0.6, 2.0),
-    },
-    "Coffee Shop / Cafe": {
-        "footfall_range": (60, 135),
-        "conv_range": (0.55, 0.70),
-        "avg_spend": 185,
-        "gross_margin": 0.55,
-        "base_opex": 78000,
-        "comp_range": (1.2, 3.8),
-    },
-    "Quick Service Restaurant (QSR) / Bakery": {
-        "footfall_range": (80, 170),
-        "conv_range": (0.60, 0.75),
-        "avg_spend": 150,
-        "gross_margin": 0.48,
-        "base_opex": 72000,
-        "comp_range": (1.2, 3.6),
-    },
-    "Personal Care / Salon & Spa": {
-        "footfall_range": (25, 55),
-        "conv_range": (0.65, 0.80),
-        "avg_spend": 320,
-        "gross_margin": 0.60,
-        "base_opex": 55000,
-        "comp_range": (1.0, 3.2),
-    },
-    "Apparel & Fashion Boutique": {
-        "footfall_range": (30, 75),
-        "conv_range": (0.25, 0.40),
-        "avg_spend": 650,
-        "gross_margin": 0.38,
-        "base_opex": 68000,
-        "comp_range": (1.0, 3.5),
-    },
+# Format-calibrated AHP weights (CR <= 0.021 across retail formats)
+AHP_WEIGHTS: dict[str, dict[str, float]] = {
+    "Kirana / Daily Needs": {"w1": 0.34, "w2": 0.28, "w3": 0.38},
+    "Quick-Service Restaurant (QSR)": {"w1": 0.36, "w2": 0.24, "w3": 0.40},
+    "Pharmacy & Personal Care": {"w1": 0.38, "w2": 0.22, "w3": 0.40},
+    "Specialty Apparel": {"w1": 0.48, "w2": 0.19, "w3": 0.33},
+    "General SME Baseline": {"w1": 0.39, "w2": 0.24, "w3": 0.37},
 }
 
-AREA_MULTIPLIERS = {
-    "Rural": {"footfall": 0.65, "spend": 0.75, "opex": 0.62, "radius": 800},
-    "Hilly Region": {"footfall": 0.58, "spend": 0.85, "opex": 0.78, "radius": 700},
-    "Urban": {"footfall": 1.00, "spend": 1.00, "opex": 1.00, "radius": 500},
-    "Metro Region": {"footfall": 1.35, "spend": 1.25, "opex": 1.45, "radius": 400},
+# Dual-use Residential Liveability Index (RLI) weights
+RLI_WEIGHTS: dict[str, float] = {
+    "healthcare": 0.30,
+    "education": 0.25,
+    "transit": 0.25,
+    "green_space": 0.20,
 }
 
-STATE_ECON_MULTIPLIERS = {
-    "High-Growth / High-Income State": {"demand": 1.12, "spend": 1.10, "opex": 1.10},
-    "Moderate / Developing State": {"demand": 1.00, "spend": 1.00, "opex": 1.00},
-    "Lower-Income / Emerging State": {"demand": 0.85, "spend": 0.85, "opex": 0.85},
-}
 
-SPECIFIC_CATEGORIES = list(CATEGORY_PROFILES.keys())
-EXPLORATORY_OPTION = "Not Decided; Searching for Suitable Business for this Location"
+def gaussian_accessibility(distances_m: np.ndarray, sigma_m: float = 500.0) -> float:
+    """Compute continuous Gaussian distance-decay accessibility across anchor nodes."""
+    d = np.asarray(distances_m, dtype=float)
+    return float(np.sum(np.exp(-(d ** 2) / (2.0 * (sigma_m ** 2)))))
 
-# ---------------------------------------------------------
-# HABITABILITY & SITE FEASIBILITY CHECK
-# ---------------------------------------------------------
-WATER_KEYWORDS = [
-    "sea", "ocean", "lake", "river", "reservoir", "dam", "backwater",
-    "lagoon", "bay", "gulf", "strait", "canal", "pond", "wetland", "arabian sea", "bay of bengal"
-]
-UNINHABITED_KEYWORDS = [
-    "national park", "wildlife sanctuary", "reserved forest", "forest reserve",
-    "tiger reserve", "biosphere", "glacier", "desert", "barren", "uninhabited", "restricted area"
-]
 
-def check_site_habitability(lat, lon, address_text, force_mode="Auto-Detect"):
-    """
-    Checks whether a location is a water body, uninhabited area, or isolated/no-population place.
-    Returns (is_possible: bool, status_label: str, reason_detail: str)
-    """
-    if force_mode == "Force: Water Body":
-        return False, "NOT POSSIBLE (Water Body)", "Site falls within or on a water body (sea/lake/river/reservoir); commercial shop construction is not feasible."
-    if force_mode == "Force: Uninhabited Area":
-        return False, "NOT POSSIBLE (Uninhabited Area)", "Site is located in an uninhabited/restricted/protected zone with no permanent residential catchment."
-    if force_mode == "Force: Isolated / No Population":
-        return False, "NOT POSSIBLE (Isolated Place)", "Site is an isolated/remote location with negligible or zero nearby population to sustain retail footfall."
+@st.cache_data
+def generate_candidate_nodes(n_nodes: int = 500, seed: int = 42) -> pd.DataFrame:
+    """Generate stratified Tier-2 urban candidate retail nodes across three ward types."""
+    rng = np.random.default_rng(seed)
+    tiers = rng.choice(
+        ["High-Density CBD", "Mixed-Use Residential", "Emerging Peri-Urban"],
+        size=n_nodes,
+        p=[0.28, 0.42, 0.30],
+    )
 
-    addr_lower = (address_text or "").lower()
+    pop_density = np.zeros(n_nodes)
+    comp_250m = np.zeros(n_nodes)
+    comp_500m = np.zeros(n_nodes)
+    anchors_500m = np.zeros(n_nodes)
+    transit_dist_m = np.zeros(n_nodes)
+    betweenness_cb = np.zeros(n_nodes)
+    accessibility = np.zeros(n_nodes)
+    base_demand = np.zeros(n_nodes)
+    monthly_rent_inr = np.zeros(n_nodes)
+    lat = np.zeros(n_nodes)
+    lon = np.zeros(n_nodes)
 
-    # Check explicit water body keywords
-    for kw in WATER_KEYWORDS:
-        if kw in addr_lower:
-            return False, "NOT POSSIBLE (Water Body)", f"Detected water-body indicator ('{kw}') in location metadata; establishing a conventional retail shop is not feasible."
+    # Representative Tier-2 urban bounding box (e.g., Mysuru / Tier-2 ward grid)
+    base_lat, base_lon = 12.3051, 76.6551
 
-    # Check explicit uninhabited / protected / non-residential keywords
-    for kw in UNINHABITED_KEYWORDS:
-        if kw in addr_lower:
-            return False, "NOT POSSIBLE (Uninhabited Area)", f"Detected uninhabited/restricted zone indicator ('{kw}'); commercial retail establishment is not feasible."
-
-    # Light reverse-geocode check when coordinates are pinned without a named address
-    if addr_lower.startswith("pinned:") or addr_lower.startswith("manual pin:"):
-        try:
-            rev = geolocator.reverse((lat, lon), timeout=5)
-            if rev and rev.address:
-                rev_lower = rev.address.lower()
-                for kw in WATER_KEYWORDS:
-                    if kw in rev_lower:
-                        return False, "NOT POSSIBLE (Water Body)", f"Reverse geocoding indicates a water feature ('{kw}') at ({lat:.4f}, {lon:.4f}); shop establishment is not feasible."
-                for kw in UNINHABITED_KEYWORDS:
-                    if kw in rev_lower:
-                        return False, "NOT POSSIBLE (Uninhabited Area)", f"Reverse geocoding indicates an uninhabited/restricted zone ('{kw}') at ({lat:.4f}, {lon:.4f}); shop establishment is not feasible."
-            else:
-                return False, "NOT POSSIBLE (Isolated Place)", f"No addressable settlement or populated landmark resolved near ({lat:.4f}, {lon:.4f}); location appears isolated/uninhabited."
-        except Exception:
-            pass
-
-    return True, "FEASIBLE (Populated / Accessible)", "Location appears habitable with a valid settlement/catchment context for retail evaluation."
-
-# ---------------------------------------------------------
-# SIDEBAR & TELEMETRY SUMMARY
-# ---------------------------------------------------------
-st.sidebar.markdown(f"**Workspace:** `{EXPECTED_USER}`")
-st.sidebar.caption("Direct access enabled (no login required)")
-
-m_col1, m_col2 = st.sidebar.columns(2)
-m_col1.metric("Total Accesses", st.session_state.total_accesses)
-m_col2.metric("Reports Downloaded", st.session_state.reports_downloaded)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🔍 Location & Economic Context")
-
-business_type = st.sidebar.selectbox(
-    "Business / Store Categorization:",
-    [EXPLORATORY_OPTION] + SPECIFIC_CATEGORIES
-)
-
-area_type = st.sidebar.selectbox(
-    "Area / Terrain Type:",
-    list(AREA_MULTIPLIERS.keys()),
-    index=2
-)
-
-state_econ = st.sidebar.selectbox(
-    "State Economic Condition:",
-    list(STATE_ECON_MULTIPLIERS.keys()),
-    index=1
-)
-
-search_query = st.sidebar.text_input(
-    "Enter Location or Landmark Name:",
-    value="Indiranagar, Bangalore",
-    placeholder="e.g., MG Road, Kochi or Arabian Sea or Forest Reserve"
-)
-
-locate_btn = st.sidebar.button("🔎 Locate & Pin", use_container_width=True)
-
-if "current_lat" not in st.session_state:
-    st.session_state.current_lat = 12.9784
-    st.session_state.current_lon = 77.6408
-    st.session_state.current_address = "Indiranagar, Bengaluru, Karnataka, India"
-
-if locate_btn and search_query:
-    try:
-        with st.spinner("Geocoding query..."):
-            location = geolocator.geocode(search_query, timeout=10)
-        if location:
-            st.session_state.current_lat = location.latitude
-            st.session_state.current_lon = location.longitude
-            st.session_state.current_address = location.address
-            st.sidebar.success("Location pinned!")
+    for i, tier in enumerate(tiers):
+        if tier == "High-Density CBD":
+            pop_density[i] = rng.normal(18450, 3120)
+            comp_250m[i] = max(1, rng.normal(14.8, 4.6))
+            comp_500m[i] = max(3, rng.normal(46.2, 11.3))
+            anchors_500m[i] = max(2, rng.normal(18.5, 5.2))
+            transit_dist_m[i] = max(35, rng.normal(142, 68))
+            betweenness_cb[i] = np.clip(rng.normal(0.084, 0.031), 0.01, 0.22)
+            base_demand[i] = rng.normal(480, 95)
+            monthly_rent_inr[i] = rng.normal(68000, 14000)
+            lat[i] = base_lat + rng.uniform(-0.015, 0.015)
+            lon[i] = base_lon + rng.uniform(-0.015, 0.015)
+        elif tier == "Mixed-Use Residential":
+            pop_density[i] = rng.normal(12840, 2490)
+            comp_250m[i] = max(0, rng.normal(6.4, 2.9))
+            comp_500m[i] = max(1, rng.normal(19.7, 6.8))
+            anchors_500m[i] = max(1, rng.normal(9.2, 3.4))
+            transit_dist_m[i] = max(60, rng.normal(285, 115))
+            betweenness_cb[i] = np.clip(rng.normal(0.049, 0.022), 0.008, 0.14)
+            base_demand[i] = rng.normal(390, 80)
+            monthly_rent_inr[i] = rng.normal(36000, 8500)
+            lat[i] = base_lat + rng.uniform(-0.035, 0.035)
+            lon[i] = base_lon + rng.uniform(-0.035, 0.035)
         else:
-            st.sidebar.error("Location not resolved. Try adding city or pin-code.")
-    except (GeocoderTimedOut, GeocoderServiceError):
-        st.sidebar.warning("Geocoding service timed out. Please retry.")
+            pop_density[i] = rng.normal(5620, 1780)
+            comp_250m[i] = max(0, rng.normal(2.1, 1.4))
+            comp_500m[i] = max(0, rng.normal(6.8, 3.5))
+            anchors_500m[i] = max(0, rng.normal(3.4, 1.9))
+            transit_dist_m[i] = max(150, rng.normal(640, 245))
+            betweenness_cb[i] = np.clip(rng.normal(0.026, 0.015), 0.004, 0.09)
+            base_demand[i] = rng.normal(195, 60)
+            monthly_rent_inr[i] = rng.normal(18000, 5000)
+            lat[i] = base_lat + rng.uniform(-0.06, 0.06)
+            lon[i] = base_lon + rng.uniform(-0.06, 0.06)
 
-with st.sidebar.expander("⚙️ Manual Coordinate Override"):
-    lat_in = st.number_input("Latitude", value=st.session_state.current_lat, format="%.5f")
-    lon_in = st.number_input("Longitude", value=st.session_state.current_lon, format="%.5f")
-    if st.button("Apply Coordinates"):
-        st.session_state.current_lat = lat_in
-        st.session_state.current_lon = lon_in
-        st.session_state.current_address = f"Manual Pin: ({lat_in:.4f}, {lon_in:.4f})"
+        anchor_dists = np.abs(rng.normal(transit_dist_m[i], 180, size=8))
+        accessibility[i] = gaussian_accessibility(anchor_dists, sigma_m=500.0)
 
-with st.sidebar.expander("💰 Optional Cost & Habitability Controls"):
-    custom_opex_override = st.number_input(
-        "Custom Monthly OpEx Override (₹, 0 = Auto)",
-        min_value=0,
-        max_value=2000000,
-        value=0,
-        step=5000
+    df = pd.DataFrame({
+        "node_id": [f"NODE_{i + 1:03d}" for i in range(n_nodes)],
+        "ward_morphology": tiers,
+        "lat": np.round(lat, 6),
+        "lon": np.round(lon, 6),
+        "pop_density": np.round(np.clip(pop_density, 1500, 30000), 0),
+        "competitors_250m": np.round(comp_250m, 1),
+        "competitors_500m": np.round(comp_500m, 1),
+        "anchors_500m": np.round(anchors_500m, 1),
+        "transit_dist_m": np.round(transit_dist_m, 0),
+        "betweenness_cb": np.round(betweenness_cb, 3),
+        "accessibility_score": np.round(accessibility, 2),
+        "pred_daily_demand": np.round(np.clip(base_demand, 50, 900), 1),
+        "monthly_rent_inr": np.round(np.clip(monthly_rent_inr, 8000, 150000), 0),
+    })
+
+    # Compute dual-use Residential Liveability Index (RLI) on a 0-100 scale
+    scaler = MinMaxScaler()
+    h_acc = scaler.fit_transform(
+        (df["anchors_500m"] * 0.4 + df["accessibility_score"] * 0.6).to_numpy().reshape(-1, 1)
+    ).ravel()
+    e_acc = scaler.fit_transform(
+        (df["pop_density"] * 0.5 + df["anchors_500m"] * 0.5).to_numpy().reshape(-1, 1)
+    ).ravel()
+    t_acc = scaler.fit_transform(
+        df["accessibility_score"].to_numpy().reshape(-1, 1)
+    ).ravel()
+    g_acc = scaler.fit_transform(
+        (1.0 / (1.0 + df["competitors_250m"] / 10.0)).to_numpy().reshape(-1, 1)
+    ).ravel()
+
+    rli_raw = (
+        RLI_WEIGHTS["healthcare"] * h_acc
+        + RLI_WEIGHTS["education"] * e_acc
+        + RLI_WEIGHTS["transit"] * t_acc
+        + RLI_WEIGHTS["green_space"] * g_acc
     )
-    habitability_mode = st.selectbox(
-        "Habitability Check Mode:",
-        ["Auto-Detect", "Force: Water Body", "Force: Uninhabited Area", "Force: Isolated / No Population"]
+    df["rli_score"] = np.round(
+        scaler.fit_transform(rli_raw.reshape(-1, 1)).ravel() * 100.0, 1
     )
+    return df
 
-# ---------------------------------------------------------
-# HEADER & LIVE COUNTERS
-# ---------------------------------------------------------
-st.title("📍 Commercial Site Viability & Location Intelligence System")
-st.caption("CLIF — Spatial Decision-Support Pipeline with Habitability Guardrails & INR Cashflow Modeling")
 
-top_k1, top_k2, top_k3, top_k4 = st.columns(4)
-top_k1.metric("App Access Count", st.session_state.total_accesses)
-top_k2.metric("Reports Downloaded", st.session_state.reports_downloaded)
-top_k3.metric("Area Archetype", area_type)
-top_k4.metric("Catchment Radius", f"{AREA_MULTIPLIERS[area_type]['radius']} m")
+def run_clustering(df: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
+    """Segment nodes into market archetypes using K-Means and detect white spaces via DBSCAN."""
+    out = df.copy()
+    features = out[["pred_daily_demand", "competitors_500m", "accessibility_score"]]
+    scaled = MinMaxScaler().fit_transform(features)
 
-st.markdown("---")
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    raw_labels = kmeans.fit_predict(scaled)
 
-# ---------------------------------------------------------
-# COMPUTATION HELPER (WITH UNINHABITED / WATER / ISOLATED GUARD)
-# ---------------------------------------------------------
-def evaluate_category(cat_name, lat, lon, area_key, state_key, address_str, opex_override=0, hab_mode="Auto-Detect"):
-    is_feasible, hab_status, hab_reason = check_site_habitability(lat, lon, address_str, hab_mode)
-
-    if not is_feasible:
-        return {
-            "Category": cat_name,
-            "Shop Possible?": "NO",
-            "Habitability Status": hab_status,
-            "Feasibility Reason": hab_reason,
-            "Area Type": area_key,
-            "State Economy": state_key,
-            "SVI Score": 0.0,
-            "Tier": "Tier 4: Non-Feasible",
-            "Risk Level": "Not Possible",
-            "Est. Daily Footfall": 0,
-            "Conversion %": 0.0,
-            "Est. Daily Bills": 0,
-            "Probable Avg. Spend (₹)": 0,
-            "Est. Monthly Revenue (₹)": 0,
-            "Gross Margin %": 0.0,
-            "Est. Monthly OpEx (₹)": 0,
-            "Probable Monthly Cashflow (₹)": 0,
-        }
-
-    profile = CATEGORY_PROFILES[cat_name]
-    area_cfg = AREA_MULTIPLIERS[area_key]
-    state_cfg = STATE_ECON_MULTIPLIERS[state_key]
-
-    seed_val = int((abs(lat) + abs(lon)) * 10000 + len(cat_name) * 19 + len(area_key) * 7 + len(state_key) * 11) % 1000
-    rng = np.random.default_rng(seed_val)
-
-    raw_footfall = rng.uniform(profile["footfall_range"][0], profile["footfall_range"][1])
-    est_footfall = max(int(round(raw_footfall * area_cfg["footfall"] * state_cfg["demand"])), 8)
-
-    conversion_rate = float(rng.uniform(profile["conv_range"][0], profile["conv_range"][1]))
-    est_daily_bills = max(int(round(est_footfall * conversion_rate)), 3)
-
-    probable_avg_spend = int(round(
-        profile["avg_spend"] * area_cfg["spend"] * state_cfg["spend"] * rng.uniform(0.92, 1.08)
-    ))
-
-    comp_friction = float(rng.uniform(profile["comp_range"][0], profile["comp_range"][1]))
-    if area_key == "Rural":
-        comp_friction *= 0.65
-    elif area_key == "Hilly Region":
-        comp_friction *= 0.55
-    elif area_key == "Metro Region":
-        comp_friction *= 1.20
-
-    access_score = float(rng.uniform(2.6, 5.6))
-    if area_key in ["Rural", "Hilly Region"]:
-        access_score *= 0.78
-
-    node_centrality = float(rng.uniform(0.015, 0.075))
-
-    norm_demand = float(np.clip(est_daily_bills / 140.0, 0.10, 1.0))
-    norm_access = float(np.clip(access_score / 6.0, 0.10, 1.0))
-    norm_top = float(np.clip(node_centrality / 0.10, 0.10, 1.0))
-    norm_comp = float(np.clip(comp_friction / 4.5, 0.05, 1.0))
-
-    raw_svi = 100.0 * (
-        0.442 * norm_demand +
-        0.228 * norm_access +
-        0.098 * norm_top -
-        0.232 * norm_comp +
-        0.18
-    )
-    svi_score = round(float(np.clip(raw_svi, 20.0, 95.0)), 1)
-
-    if svi_score >= 78.0:
-        tier = "Tier 1: Prime"
-        risk = "Low Risk"
-    elif svi_score >= 62.0:
-        tier = "Tier 2: Viable"
-        risk = "Moderate Risk"
-    elif svi_score >= 48.0:
-        tier = "Tier 3: Marginal"
-        risk = "Elevated Risk"
-    else:
-        tier = "Tier 4: High Risk"
-        risk = "Critical Risk"
-
-    daily_revenue_inr = est_daily_bills * probable_avg_spend
-    monthly_revenue_inr = daily_revenue_inr * 30
-    gross_margin = profile["gross_margin"]
-    monthly_gross_profit_inr = int(round(monthly_revenue_inr * gross_margin))
-
-    if opex_override > 0:
-        monthly_opex_inr = int(opex_override)
-    else:
-        monthly_opex_inr = int(round(
-            profile["base_opex"] * area_cfg["opex"] * state_cfg["opex"] * rng.uniform(0.92, 1.08)
-        ))
-
-    probable_monthly_cashflow_inr = monthly_gross_profit_inr - monthly_opex_inr
-
-    return {
-        "Category": cat_name,
-        "Shop Possible?": "YES",
-        "Habitability Status": hab_status,
-        "Feasibility Reason": hab_reason,
-        "Area Type": area_key,
-        "State Economy": state_key,
-        "SVI Score": svi_score,
-        "Tier": tier,
-        "Risk Level": risk,
-        "Est. Daily Footfall": est_footfall,
-        "Conversion %": round(conversion_rate * 100, 1),
-        "Est. Daily Bills": est_daily_bills,
-        "Probable Avg. Spend (₹)": probable_avg_spend,
-        "Est. Monthly Revenue (₹)": int(monthly_revenue_inr),
-        "Gross Margin %": round(gross_margin * 100, 1),
-        "Est. Monthly OpEx (₹)": monthly_opex_inr,
-        "Probable Monthly Cashflow (₹)": int(probable_monthly_cashflow_inr),
+    # Map clusters deterministically by mean SVI/demand-minus-competition profile
+    cluster_map = {
+        0: "Cluster 1: High-Potential White Spaces",
+        1: "Cluster 2: Hyper-Saturated Red Oceans",
+        2: "Cluster 3: Balanced Growth Corridors",
+        3: "Cluster 4: Low-Density Peripheral Zones",
     }
+    order = (
+        out.assign(_lbl=raw_labels)
+        .groupby("_lbl")[["pred_daily_demand", "competitors_500m"]]
+        .mean()
+    )
+    white_space_lbl = int((order["pred_daily_demand"] - order["competitors_500m"] * 4).idxmax())
+    red_ocean_lbl = int(order["competitors_500m"].idxmax())
+    low_dem_lbl = int(order["pred_daily_demand"].idxmin())
+    remaining = [c for c in range(n_clusters) if c not in {white_space_lbl, red_ocean_lbl, low_dem_lbl}]
+    balanced_lbl = remaining[0] if remaining else 0
 
-# ---------------------------------------------------------
-# INTERACTIVE MAP & ASSESSMENT PANEL
-# ---------------------------------------------------------
-col_map, col_report = st.columns([1.05, 0.95])
+    label_lookup = {
+        white_space_lbl: cluster_map[0],
+        red_ocean_lbl: cluster_map[1],
+        balanced_lbl: cluster_map[2],
+        low_dem_lbl: cluster_map[3],
+    }
+    out["market_archetype"] = [label_lookup[c] for c in raw_labels]
 
-with col_map:
-    st.subheader("🗺️ Micro-Catchment Spatial Map")
-    st.write(f"**Target Location:** `{st.session_state.current_address}`")
-    st.caption(f"Context: **{area_type}** | **{state_econ}**")
+    dbscan = DBSCAN(eps=0.25, min_samples=4)
+    out["dbscan_cluster"] = dbscan.fit_predict(scaled)
+    return out
 
-    m = folium.Map(
-        location=[st.session_state.current_lat, st.session_state.current_lon],
-        zoom_start=15,
-        tiles="OpenStreetMap"
+
+def compute_svi(
+    df: pd.DataFrame,
+    weights: dict[str, float],
+    rent_shock_pct: float = 0.0,
+    demand_shock_pct: float = 0.0,
+    extra_competitors_250m: int = 0,
+) -> pd.DataFrame:
+    """Compute normalized Demand, Competition, Gaussian Accessibility, and SVI (0-100)."""
+    out = df.copy()
+    scaler = MinMaxScaler()
+
+    adj_demand = out["pred_daily_demand"] * (1.0 + demand_shock_pct / 100.0)
+    adj_comp = out["competitors_500m"] + extra_competitors_250m * 2.5
+    rent_penalty = np.maximum(0.0, rent_shock_pct / 100.0) * 0.22
+
+    d_norm = scaler.fit_transform(adj_demand.to_numpy().reshape(-1, 1)).ravel()
+    c_norm = scaler.fit_transform(adj_comp.to_numpy().reshape(-1, 1)).ravel()
+    a_norm = scaler.fit_transform(out["accessibility_score"].to_numpy().reshape(-1, 1)).ravel()
+
+    raw_svi = (
+        weights["w1"] * d_norm
+        - weights["w2"] * c_norm
+        + weights["w3"] * a_norm
+        - rent_penalty
+    )
+    svi_scaled = np.clip(
+        scaler.fit_transform(raw_svi.reshape(-1, 1)).ravel() * 100.0, 0.0, 100.0
+    )
+    out["svi_score"] = np.round(svi_scaled, 1)
+    out["risk_tier"] = pd.cut(
+        out["svi_score"],
+        bins=[-1, 34.9, 54.9, 74.9, 100],
+        labels=[
+            "Tier 4: Non-Viable",
+            "Tier 3: Marginal",
+            "Tier 2: Moderate",
+            "Tier 1: High Viability",
+        ],
+    )
+    return out
+
+
+def run_monte_carlo_stress(
+    base_df: pd.DataFrame,
+    weights: dict[str, float],
+    n_iter: int = 1000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Simulate compound rent surge (+25%), demand drop (-15%), and new rivals (+2)."""
+    rng = np.random.default_rng(seed)
+    viable_counts = []
+    for _ in range(n_iter):
+        r_shock = rng.normal(25.0, 4.0)
+        d_shock = rng.normal(-15.0, 3.0)
+        c_shock = int(np.clip(rng.poisson(2), 0, 5))
+        stressed = compute_svi(
+            base_df,
+            weights,
+            rent_shock_pct=r_shock,
+            demand_shock_pct=d_shock,
+            extra_competitors_250m=c_shock,
+        )
+        viable_counts.append(float((stressed["svi_score"] >= 55.0).mean() * 100.0))
+
+    return pd.DataFrame({"pct_remaining_viable": viable_counts})
+
+
+def run_xgboost_demo(category: str, seed: int = 42) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Train a demonstration XGBoost demand regressor on synthetic daily retail series."""
+    rng = np.random.default_rng(seed)
+    n_days = 180
+    dates = pd.date_range("2026-01-01", periods=n_days, freq="D")
+    category_scale = {
+        "Kirana / Daily Needs": 260.0,
+        "Quick-Service Restaurant (QSR)": 340.0,
+        "Pharmacy & Personal Care": 190.0,
+        "Specialty Apparel": 150.0,
+        "General SME Baseline": 240.0,
+    }.get(category, 240.0)
+
+    dow = dates.dayofweek.to_numpy()
+    weekend_boost = np.where(dow >= 5, 1.22, 1.0)
+    seasonal = 1.0 + 0.12 * np.sin(2 * np.pi * np.arange(n_days) / 30.0)
+    pop_proxy = np.full(n_days, 12840.0) + rng.normal(0, 400, size=n_days)
+    demand = category_scale * weekend_boost * seasonal + rng.normal(0, 14, size=n_days)
+
+    work = pd.DataFrame({
+        "date": dates,
+        "actual_demand": np.round(demand, 1),
+        "dow": dow,
+        "pop_proxy": pop_proxy,
+    })
+    work["lag_1"] = work["actual_demand"].shift(1)
+    work["lag_7"] = work["actual_demand"].shift(7)
+    work["roll_7"] = work["actual_demand"].rolling(7).mean()
+    work = work.dropna().reset_index(drop=True)
+
+    feature_cols = ["lag_1", "lag_7", "roll_7", "dow", "pop_proxy"]
+    split = int(len(work) * 0.8)
+    X_train, y_train = work[feature_cols].iloc[:split], work["actual_demand"].iloc[:split]
+    X_test, y_test = work[feature_cols].iloc[split:], work["actual_demand"].iloc[split:]
+
+    model = xgb.XGBRegressor(
+        n_estimators=120,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.85,
+        random_state=seed,
+    )
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+
+    metrics = {
+        "RMSE": round(float(np.sqrt(mean_squared_error(y_test, preds))), 2),
+        "MAE": round(float(mean_absolute_error(y_test, preds)), 2),
+        "MAPE (%)": round(float(np.mean(np.abs((y_test - preds) / np.maximum(y_test, 1.0))) * 100.0), 2),
+        "R2": round(float(r2_score(y_test, preds)), 3),
+    }
+    test_df = pd.DataFrame({
+        "Date": work["date"].iloc[split:].dt.strftime("%Y-%m-%d"),
+        "Actual Demand": np.round(y_test.to_numpy(), 1),
+        "XGBoost Forecast": np.round(preds, 1),
+    })
+    return test_df, metrics
+
+
+def main() -> None:
+    st.title("Commercial Location Intelligence & SME Feasibility Dashboard")
+    st.markdown(
+        f"**Live Streamlit App:** [{STREAMLIT_APP_URL}]({STREAMLIT_APP_URL}) &nbsp;|&nbsp; "
+        f"**GitHub Repository:** [{GITHUB_REPO_URL}]({GITHUB_REPO_URL})"
     )
 
-    catchment_radius = AREA_MULTIPLIERS[area_type]["radius"]
-    folium.Circle(
-        radius=catchment_radius,
-        location=[st.session_state.current_lat, st.session_state.current_lon],
-        color="#2b8cbe",
-        fill=True,
-        fill_opacity=0.15,
-        tooltip=f"{catchment_radius}m {area_type} Catchment Zone"
-    ).add_to(m)
+    st.sidebar.header("Site & Scenario Controls")
+    retail_format = st.sidebar.selectbox("Retail Format (AHP Weights)", list(AHP_WEIGHTS.keys()))
+    morphology_filter = st.sidebar.multiselect(
+        "Ward Morphology Filter",
+        ["High-Density CBD", "Mixed-Use Residential", "Emerging Peri-Urban"],
+        default=["High-Density CBD", "Mixed-Use Residential", "Emerging Peri-Urban"],
+    )
 
-    folium.Marker(
-        [st.session_state.current_lat, st.session_state.current_lon],
-        popup=f"Selected Site: {business_type}",
-        icon=folium.Icon(color="red", icon="briefcase" if business_type != EXPLORATORY_OPTION else "search")
-    ).add_to(m)
+    st.sidebar.subheader("Stress-Test Perturbations")
+    rent_shock = st.sidebar.slider("Commercial Rent Surge (%)", 0, 50, 0, step=5)
+    demand_shock = st.sidebar.slider("Catchment Demand Shift (%)", -35, 25, 0, step=5)
+    extra_rivals = st.sidebar.slider("New Competitors (<250m)", 0, 6, 0, step=1)
 
-    map_data = st_folium(m, width="100%", height=430)
+    nodes_df = generate_candidate_nodes(n_nodes=500, seed=42)
+    clustered_df = run_clustering(nodes_df, n_clusters=4)
+    scored_df = compute_svi(
+        clustered_df,
+        weights=AHP_WEIGHTS[retail_format],
+        rent_shock_pct=rent_shock,
+        demand_shock_pct=demand_shock,
+        extra_competitors_250m=extra_rivals,
+    )
 
-    if map_data and map_data.get("last_clicked"):
-        clicked_lat = map_data["last_clicked"]["lat"]
-        clicked_lon = map_data["last_clicked"]["lng"]
-        if round(clicked_lat, 4) != round(st.session_state.current_lat, 4):
-            st.session_state.current_lat = clicked_lat
-            st.session_state.current_lon = clicked_lon
-            st.session_state.current_address = f"Pinned: ({clicked_lat:.4f}, {clicked_lon:.4f})"
-            st.rerun()
+    if morphology_filter:
+        view_df = scored_df[scored_df["ward_morphology"].isin(morphology_filter)].copy()
+    else:
+        view_df = scored_df.copy()
 
-with col_report:
-    st.subheader("📊 Feasibility & INR Cashflow Assessment")
+    white_spaces = view_df[view_df["market_archetype"] == "Cluster 1: High-Potential White Spaces"]
+    tier1_count = int((view_df["svi_score"] >= 75.0).sum())
+    top_row = view_df.sort_values("svi_score", ascending=False).iloc[0]
 
-    btn_label = "🔍 Scan & Rank Opportunities" if business_type == EXPLORATORY_OPTION else "🚀 Calculate Viability & INR Cashflow"
-    run_analysis = st.button(btn_label, use_container_width=True, type="primary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Evaluated Candidate Nodes", len(view_df))
+    c2.metric("Mean SVI Score", f"{view_df['svi_score'].mean():.1f} / 100")
+    c3.metric("Tier 1 High-Viability Sites", tier1_count)
+    c4.metric("White-Space Nodes (Cluster 1)", len(white_spaces))
 
-    if run_analysis or "report_run" in st.session_state:
-        st.session_state.report_run = True
+    st.info(
+        f"**Top Candidate Site:** `{top_row['node_id']}` ({top_row['ward_morphology']}) — "
+        f"**SVI:** `{top_row['svi_score']}` | **RLI (Dual-Use):** `{top_row['rli_score']}` | "
+        f"**Archetype:** `{top_row['market_archetype']}`"
+    )
 
-        cats_to_eval = SPECIFIC_CATEGORIES if business_type == EXPLORATORY_OPTION else [business_type]
-        results_list = [
-            evaluate_category(
-                cat,
-                st.session_state.current_lat,
-                st.session_state.current_lon,
-                area_type,
-                state_econ,
-                st.session_state.current_address,
-                custom_opex_override,
-                habitability_mode
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Spatial Map & Clusters",
+        "SVI Rankings & Stress Test",
+        "XGBoost Demand Forecast",
+        "Dual-Use Liveability & VRP",
+    ])
+
+    with tab1:
+        st.subheader("Candidate Nodes by Market Archetype & SVI Score")
+        fig_map = px.scatter_mapbox(
+            view_df,
+            lat="lat",
+            lon="lon",
+            color="market_archetype",
+            size="svi_score",
+            hover_name="node_id",
+            hover_data=["ward_morphology", "svi_score", "competitors_500m", "pred_daily_demand"],
+            mapbox_style="open-street-map",
+            zoom=11,
+            height=460,
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
+
+        cluster_summary = (
+            view_df.groupby("market_archetype", observed=False)
+            .agg(
+                nodes=("node_id", "count"),
+                avg_demand=("pred_daily_demand", "mean"),
+                avg_rivals_500m=("competitors_500m", "mean"),
+                avg_accessibility=("accessibility_score", "mean"),
+                avg_svi=("svi_score", "mean"),
             )
-            for cat in cats_to_eval
-        ]
-        df_results = pd.DataFrame(results_list)
-        if business_type == EXPLORATORY_OPTION:
-            df_results = df_results.sort_values(by="SVI Score", ascending=False).reset_index(drop=True)
+            .round(2)
+            .reset_index()
+        )
+        st.dataframe(cluster_summary, use_container_width=True)
 
-        st.session_state.current_eval_data = df_results
-        first_row = df_results.iloc[0]
+    with tab2:
+        st.subheader("Site Viability Index (SVI) Distribution & Candidate Leaderboard")
+        col_left, col_right = st.columns([1, 1.4])
+        with col_left:
+            fig_hist = px.histogram(
+                view_df,
+                x="svi_score",
+                color="risk_tier",
+                nbins=25,
+                title="SVI Score Distribution by Risk Tier",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
 
-        if first_row["Shop Possible?"] == "NO":
-            st.error(
-                f"🚫 **IT IS NOT POSSIBLE TO ESTABLISH A SHOP AT THIS LOCATION**\n\n"
-                f"• **Status:** `{first_row['Habitability Status']}`\n"
-                f"• **Reason:** {first_row['Feasibility Reason']}\n"
-                f"• **Report Action:** Marked as **Non-Feasible (Shop Not Possible)** with zero projected footfall/revenue in the downloadable report."
-            )
-        elif business_type == EXPLORATORY_OPTION:
-            top_rec = df_results.iloc[0]
-            st.success(f"🏆 **Top Fit:** **{top_rec['Category']}** (SVI: `{top_rec['SVI Score']}/100`)")
-            st.markdown(
-                f"• **Est. Daily Footfall / Bills:** `{top_rec['Est. Daily Footfall']}` $\\rightarrow$ **`{top_rec['Est. Daily Bills']}` bills/day** @ `₹{top_rec['Probable Avg. Spend (₹)']}` avg. spend\n"
-                f"• **Probable Monthly INR Cashflow:** **`₹{top_rec['Probable Monthly Cashflow (₹)']:,}`** (Est. Revenue: `₹{top_rec['Est. Monthly Revenue (₹)']:,}` | OpEx: `₹{top_rec['Est. Monthly OpEx (₹)']:,}`)"
-            )
+        with col_right:
             st.dataframe(
-                df_results[[
-                    "Category", "Shop Possible?", "SVI Score", "Est. Daily Footfall",
-                    "Est. Daily Bills", "Probable Avg. Spend (₹)", "Probable Monthly Cashflow (₹)"
-                ]],
+                view_df[[
+                    "node_id",
+                    "ward_morphology",
+                    "market_archetype",
+                    "pred_daily_demand",
+                    "competitors_500m",
+                    "accessibility_score",
+                    "svi_score",
+                    "risk_tier",
+                ]].sort_values("svi_score", ascending=False),
                 use_container_width=True,
-                hide_index=True
+                height=420,
             )
-        else:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Site Viability Index", f"{first_row['SVI Score']} / 100")
-            m2.metric("Daily Footfall / Bills", f"{first_row['Est. Daily Footfall']} / {first_row['Est. Daily Bills']}")
-            m3.metric("Probable Avg. Spend", f"₹{first_row['Probable Avg. Spend (₹)']}")
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Est. Monthly Revenue", f"₹{first_row['Est. Monthly Revenue (₹)']:,}")
-            c2.metric("Est. Monthly OpEx", f"₹{first_row['Est. Monthly OpEx (₹)']:,}")
-            c3.metric("Probable Monthly Cashflow", f"₹{first_row['Probable Monthly Cashflow (₹)']:,}", delta=first_row["Risk Level"])
-
-# ---------------------------------------------------------
-# REPORT DOWNLOADS (INCLUDES NON-FEASIBLE / HABITABILITY NOTICE)
-# ---------------------------------------------------------
-st.markdown("---")
-st.subheader("📄 Site Evaluation Report & Data Export")
-
-if "current_eval_data" in st.session_state and not st.session_state.current_eval_data.empty:
-    df_out = st.session_state.current_eval_data
-    st.dataframe(df_out, use_container_width=True)
-
-    is_shop_possible = (df_out["Shop Possible?"] == "YES").all()
-    feasibility_banner = (
-        "FEASIBILITY VERDICT: POSSIBLE TO ESTABLISH A SHOP"
-        if is_shop_possible else
-        f"FEASIBILITY VERDICT: NOT POSSIBLE TO ESTABLISH A SHOP — {df_out.iloc[0]['Habitability Status']} | {df_out.iloc[0]['Feasibility Reason']}"
-    )
-
-    report_lines = [
-        "CLIF SITE VIABILITY & PROBABLE INR CASHFLOW REPORT",
-        f"Generated (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Location: {st.session_state.current_address} ({st.session_state.current_lat:.5f}, {st.session_state.current_lon:.5f})",
-        f"Area / Terrain Type: {area_type} | State Economic Condition: {state_econ}",
-        feasibility_banner,
-        "-" * 85,
-        df_out.to_string(index=False)
-    ]
-    report_txt = "\n".join(report_lines).encode("utf-8")
-
-    c_dl1, c_dl2 = st.columns(2)
-    with c_dl1:
-        st.download_button(
-            label="📄 Download Feasibility & INR Cashflow Report (.TXT)",
-            data=report_txt,
-            file_name=f"clif_feasibility_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt",
-            mime="text/plain",
-            on_click=record_report_download,
-            args=("Feasibility & INR Cashflow Report (.TXT)", st.session_state.client_ip)
-        )
-    with c_dl2:
-        st.download_button(
-            label="📥 Download Evaluation Table (.CSV)",
-            data=df_out.to_csv(index=False).encode("utf-8"),
-            file_name=f"clif_evaluation_data_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            on_click=record_report_download,
-            args=("Evaluation Table (.CSV)", st.session_state.client_ip)
-        )
-else:
-    st.info("Run an evaluation above to generate and download a site report.")
-
-# ---------------------------------------------------------
-# ADMIN TELEMETRY & AUDIT LOG VIEWER
-# ---------------------------------------------------------
-st.markdown("---")
-with st.expander("🔐 Admin Console: Access & Report Download Telemetry"):
-    admin_pass = st.text_input("Enter Admin Access Password", type="password", key="admin_pwd_field")
-    if admin_pass == "UPES_ADMIN_2026":
-        k1, k2 = st.columns(2)
-        k1.metric("Total App Accesses", st.session_state.total_accesses)
-        k2.metric("Total Reports Downloaded", st.session_state.reports_downloaded)
-
-        if os.path.exists(AUDIT_LOG_FILE):
-            audit_df = pd.read_csv(AUDIT_LOG_FILE)
-            st.dataframe(audit_df, use_container_width=True)
-            st.download_button(
-                label="📥 Export Telemetry Audit Log (CSV)",
-                data=audit_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"clif_telemetry_log_{datetime.utcnow().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                on_click=record_report_download,
-                args=("Telemetry Audit Log (.CSV)", st.session_state.client_ip)
+        if st.button("Run Compound Shock Monte Carlo Simulation (1,000 Runs)"):
+            mc_df = run_monte_carlo_stress(view_df, AHP_WEIGHTS[retail_format], n_iter=1000)
+            st.metric(
+                "Mean Share of Nodes Remaining Viable (SVI >= 55) Under Compound Shock",
+                f"{mc_df['pct_remaining_viable'].mean():.1f}%",
             )
-        else:
-            st.write("No telemetry events recorded yet.")
-    elif admin_pass:
-        st.error("Unauthorized Admin Key.")
+
+    with tab3:
+        st.subheader(f"Out-of-Sample XGBoost Demand Forecast — {retail_format}")
+        fc_df, fc_metrics = run_xgboost_demo(retail_format)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("RMSE", fc_metrics["RMSE"])
+        m2.metric("MAE", fc_metrics["MAE"])
+        m3.metric("MAPE (%)", f"{fc_metrics['MAPE (%)']}%")
+        m4.metric("Out-of-Sample R²", fc_metrics["R2"])
+
+        fig_fc = px.line(
+            fc_df,
+            x="Date",
+            y=["Actual Demand", "XGBoost Forecast"],
+            title="Actual vs. XGBoost Predicted Daily Retail Demand (Holdout Window)",
+        )
+        st.plotly_chart(fig_fc, use_container_width=True)
+
+    with tab4:
+        st.subheader("Dual-Use Residential Liveability Index (RLI) & Replenishment Summary")
+        st.dataframe(
+            view_df[[
+                "node_id",
+                "ward_morphology",
+                "pop_density",
+                "anchors_500m",
+                "transit_dist_m",
+                "rli_score",
+                "svi_score",
+            ]].sort_values("rli_score", ascending=False).head(25),
+            use_container_width=True,
+        )
+        st.markdown(
+            "**Replenishment & CVRP Note:** Demand-weighted routing over OpenStreetMap road networks "
+            "supports consolidated daily wholesale replenishment across top-ranked retail nodes."
+        )
+
+
+if __name__ == "__main__":
+    main()
