@@ -155,33 +155,49 @@ def run_clustering(df: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
     features = out[["pred_daily_demand", "competitors_500m", "accessibility_score"]]
     scaled = MinMaxScaler().fit_transform(features)
 
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    actual_k = min(n_clusters, len(out))
+    kmeans = KMeans(n_clusters=actual_k, random_state=42, n_init=10)
     raw_labels = kmeans.fit_predict(scaled)
 
-    cluster_map = {
-        0: "Cluster 1: High-Potential White Spaces",
-        1: "Cluster 2: Hyper-Saturated Red Oceans",
-        2: "Cluster 3: Balanced Growth Corridors",
-        3: "Cluster 4: Low-Density Peripheral Zones",
-    }
+    archetype_names = [
+        "Cluster 1: High-Potential White Spaces",
+        "Cluster 2: Hyper-Saturated Red Oceans",
+        "Cluster 3: Balanced Growth Corridors",
+        "Cluster 4: Low-Density Peripheral Zones",
+    ]
+
     order = (
         out.assign(_lbl=raw_labels)
         .groupby("_lbl")[["pred_daily_demand", "competitors_500m"]]
         .mean()
     )
-    white_space_lbl = int((order["pred_daily_demand"] - order["competitors_500m"] * 4).idxmax())
-    red_ocean_lbl = int(order["competitors_500m"].idxmax())
-    low_dem_lbl = int(order["pred_daily_demand"].idxmin())
-    remaining = [c for c in range(n_clusters) if c not in {white_space_lbl, red_ocean_lbl, low_dem_lbl}]
-    balanced_lbl = remaining[0] if remaining else 0
 
-    label_lookup = {
-        white_space_lbl: cluster_map[0],
-        red_ocean_lbl: cluster_map[1],
-        balanced_lbl: cluster_map[2],
-        low_dem_lbl: cluster_map[3],
-    }
-    out["market_archetype"] = [label_lookup[c] for c in raw_labels]
+    assigned: dict[int, str] = {}
+    remaining = list(order.index)
+
+    if remaining:
+        ws_lbl = max(
+            remaining,
+            key=lambda c: order.loc[c, "pred_daily_demand"] - order.loc[c, "competitors_500m"] * 4.0,
+        )
+        assigned[ws_lbl] = archetype_names[0]
+        remaining.remove(ws_lbl)
+
+    if remaining:
+        ro_lbl = max(remaining, key=lambda c: order.loc[c, "competitors_500m"])
+        assigned[ro_lbl] = archetype_names[1]
+        remaining.remove(ro_lbl)
+
+    if remaining:
+        ld_lbl = min(remaining, key=lambda c: order.loc[c, "pred_daily_demand"])
+        assigned[ld_lbl] = archetype_names[3]
+        remaining.remove(ld_lbl)
+
+    for idx, c in enumerate(remaining):
+        assigned[c] = archetype_names[min(2 + idx, len(archetype_names) - 1)]
+
+    default_name = archetype_names[2]
+    out["market_archetype"] = [assigned.get(int(c), default_name) for c in raw_labels]
 
     dbscan = DBSCAN(eps=0.25, min_samples=4)
     out["dbscan_cluster"] = dbscan.fit_predict(scaled)
@@ -354,6 +370,10 @@ def main() -> None:
         view_df = scored_df[scored_df["ward_morphology"].isin(morphology_filter)].copy()
     else:
         view_df = scored_df.copy()
+
+    if view_df.empty:
+        st.warning("No candidate nodes match the current filter selection.")
+        return
 
     white_spaces = view_df[view_df["market_archetype"] == "Cluster 1: High-Potential White Spaces"]
     tier1_count = int((view_df["svi_score"] >= 75.0).sum())
