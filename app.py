@@ -1,11 +1,18 @@
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 import xgboost as xgb
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
+
+try:
+    import plotly.express as px
+
+    HAS_PLOTLY = True
+except ModuleNotFoundError:
+    px = None
+    HAS_PLOTLY = False
 
 STREAMLIT_APP_URL = "https://commercial-location-intelligence-khjt7prif574msk2tvddnf.streamlit.app/"
 GITHUB_REPO_URL = "https://github.com/jagadeshkumar010/commercial-location-intelligence"
@@ -62,7 +69,6 @@ def generate_candidate_nodes(n_nodes: int = 500, seed: int = 42) -> pd.DataFrame
     lat = np.zeros(n_nodes)
     lon = np.zeros(n_nodes)
 
-    # Representative Tier-2 urban bounding box (e.g., Mysuru / Tier-2 ward grid)
     base_lat, base_lon = 12.3051, 76.6551
 
     for i, tier in enumerate(tiers):
@@ -119,7 +125,6 @@ def generate_candidate_nodes(n_nodes: int = 500, seed: int = 42) -> pd.DataFrame
         "monthly_rent_inr": np.round(np.clip(monthly_rent_inr, 8000, 150000), 0),
     })
 
-    # Compute dual-use Residential Liveability Index (RLI) on a 0-100 scale
     scaler = MinMaxScaler()
     h_acc = scaler.fit_transform(
         (df["anchors_500m"] * 0.4 + df["accessibility_score"] * 0.6).to_numpy().reshape(-1, 1)
@@ -155,7 +160,6 @@ def run_clustering(df: pd.DataFrame, n_clusters: int = 4) -> pd.DataFrame:
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     raw_labels = kmeans.fit_predict(scaled)
 
-    # Map clusters deterministically by mean SVI/demand-minus-competition profile
     cluster_map = {
         0: "Cluster 1: High-Potential White Spaces",
         1: "Cluster 2: Hyper-Saturated Red Oceans",
@@ -319,6 +323,12 @@ def main() -> None:
         f"**GitHub Repository:** [{GITHUB_REPO_URL}]({GITHUB_REPO_URL})"
     )
 
+    if not HAS_PLOTLY:
+        st.warning(
+            "`plotly` is not installed in the active environment; rendering built-in Streamlit charts. "
+            "Add `plotly>=5.20.0` to `requirements.txt` and reboot for interactive Plotly charts."
+        )
+
     st.sidebar.header("Site & Scenario Controls")
     retail_format = st.sidebar.selectbox("Retail Format (AHP Weights)", list(AHP_WEIGHTS.keys()))
     morphology_filter = st.sidebar.multiselect(
@@ -355,123 +365,4 @@ def main() -> None:
     c1.metric("Evaluated Candidate Nodes", len(view_df))
     c2.metric("Mean SVI Score", f"{view_df['svi_score'].mean():.1f} / 100")
     c3.metric("Tier 1 High-Viability Sites", tier1_count)
-    c4.metric("White-Space Nodes (Cluster 1)", len(white_spaces))
-
-    st.info(
-        f"**Top Candidate Site:** `{top_row['node_id']}` ({top_row['ward_morphology']}) — "
-        f"**SVI:** `{top_row['svi_score']}` | **RLI (Dual-Use):** `{top_row['rli_score']}` | "
-        f"**Archetype:** `{top_row['market_archetype']}`"
-    )
-
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "Spatial Map & Clusters",
-        "SVI Rankings & Stress Test",
-        "XGBoost Demand Forecast",
-        "Dual-Use Liveability & VRP",
-    ])
-
-    with tab1:
-        st.subheader("Candidate Nodes by Market Archetype & SVI Score")
-        fig_map = px.scatter_mapbox(
-            view_df,
-            lat="lat",
-            lon="lon",
-            color="market_archetype",
-            size="svi_score",
-            hover_name="node_id",
-            hover_data=["ward_morphology", "svi_score", "competitors_500m", "pred_daily_demand"],
-            mapbox_style="open-street-map",
-            zoom=11,
-            height=460,
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
-
-        cluster_summary = (
-            view_df.groupby("market_archetype", observed=False)
-            .agg(
-                nodes=("node_id", "count"),
-                avg_demand=("pred_daily_demand", "mean"),
-                avg_rivals_500m=("competitors_500m", "mean"),
-                avg_accessibility=("accessibility_score", "mean"),
-                avg_svi=("svi_score", "mean"),
-            )
-            .round(2)
-            .reset_index()
-        )
-        st.dataframe(cluster_summary, use_container_width=True)
-
-    with tab2:
-        st.subheader("Site Viability Index (SVI) Distribution & Candidate Leaderboard")
-        col_left, col_right = st.columns([1, 1.4])
-        with col_left:
-            fig_hist = px.histogram(
-                view_df,
-                x="svi_score",
-                color="risk_tier",
-                nbins=25,
-                title="SVI Score Distribution by Risk Tier",
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
-
-        with col_right:
-            st.dataframe(
-                view_df[[
-                    "node_id",
-                    "ward_morphology",
-                    "market_archetype",
-                    "pred_daily_demand",
-                    "competitors_500m",
-                    "accessibility_score",
-                    "svi_score",
-                    "risk_tier",
-                ]].sort_values("svi_score", ascending=False),
-                use_container_width=True,
-                height=420,
-            )
-
-        if st.button("Run Compound Shock Monte Carlo Simulation (1,000 Runs)"):
-            mc_df = run_monte_carlo_stress(view_df, AHP_WEIGHTS[retail_format], n_iter=1000)
-            st.metric(
-                "Mean Share of Nodes Remaining Viable (SVI >= 55) Under Compound Shock",
-                f"{mc_df['pct_remaining_viable'].mean():.1f}%",
-            )
-
-    with tab3:
-        st.subheader(f"Out-of-Sample XGBoost Demand Forecast — {retail_format}")
-        fc_df, fc_metrics = run_xgboost_demo(retail_format)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("RMSE", fc_metrics["RMSE"])
-        m2.metric("MAE", fc_metrics["MAE"])
-        m3.metric("MAPE (%)", f"{fc_metrics['MAPE (%)']}%")
-        m4.metric("Out-of-Sample R²", fc_metrics["R2"])
-
-        fig_fc = px.line(
-            fc_df,
-            x="Date",
-            y=["Actual Demand", "XGBoost Forecast"],
-            title="Actual vs. XGBoost Predicted Daily Retail Demand (Holdout Window)",
-        )
-        st.plotly_chart(fig_fc, use_container_width=True)
-
-    with tab4:
-        st.subheader("Dual-Use Residential Liveability Index (RLI) & Replenishment Summary")
-        st.dataframe(
-            view_df[[
-                "node_id",
-                "ward_morphology",
-                "pop_density",
-                "anchors_500m",
-                "transit_dist_m",
-                "rli_score",
-                "svi_score",
-            ]].sort_values("rli_score", ascending=False).head(25),
-            use_container_width=True,
-        )
-        st.markdown(
-            "**Replenishment & CVRP Note:** Demand-weighted routing over OpenStreetMap road networks "
-            "supports consolidated daily wholesale replenishment across top-ranked retail nodes."
-        )
-
-
-if __name__ == "__main__":
-    main()
+    c4.metric("White-Space Nodes (Cluster 1)",
